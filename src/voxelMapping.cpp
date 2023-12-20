@@ -68,6 +68,7 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool pcd_save_en = false;
 double lidar_time_offset = 0.0;
 /**************************/
 
@@ -87,7 +88,7 @@ double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_surf_min = 0;
 double total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
-int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_index = 0;
+int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -413,14 +414,13 @@ bool sync_packages(MeasureGroup &meas)
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 
-
 void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 {
-    if(scan_pub_en)
+    PointCloudXYZI laserCloudWorld;
+    if(scan_pub_en || pcd_save_en)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
-        PointCloudXYZI laserCloudWorld;
         for (int i = 0; i < size; i++)
         {
             PointType const * const p = &laserCloudFullRes->points[i];
@@ -442,7 +442,9 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 //            RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
 //                                &laserCloudWorld->points[i]);
         }
-
+    }
+    if (scan_pub_en)
+    {
         sensor_msgs::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(laserCloudWorld, laserCloudmsg);
         laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
@@ -451,6 +453,32 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
         publish_count -= PUBFRAME_PERIOD;
     }
 
+    if (pcd_save_en)
+    {
+        int size = feats_undistort->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld( \
+                        new PointCloudXYZI(size, 1));
+
+        for (int i = 0; i < size; i++)
+        {
+            RGBpointBodyToWorld(&feats_undistort->points[i], \
+                                &laserCloudWorld->points[i]);
+        }
+        *pcl_wait_save += *laserCloudWorld;
+
+        static int scan_wait_num = 0;
+        scan_wait_num ++;
+        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
+        {
+            pcd_index ++;
+            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+            pcl::PCDWriter pcd_writer;
+            cout << "current scan saved to /PCD/" << all_points_dir << endl;
+            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+            pcl_wait_save->clear();
+            scan_wait_num = 0;
+        }
+    }
 }
 
 void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
@@ -854,6 +882,9 @@ int main(int argc, char** argv)
         layer_size.push_back(layer_point_size[i]);
     }
 
+    nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
+    nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
+    
     path.header.stamp    = ros::Time::now();
     path.header.frame_id ="camera_init";
 
@@ -1073,7 +1104,7 @@ int main(int argc, char** argv)
 //
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
-            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull);
+            if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             if (publish_voxel_map) {
                 pubVoxelMap(voxel_map, publish_max_voxel_layer, voxel_map_pub);
@@ -1085,6 +1116,31 @@ int main(int argc, char** argv)
 
         status = ros::ok();
         rate.sleep();
+    }
+
+    /**************** save map ****************/
+    /* 1. make sure you have enough memories
+    /* 2. pcd save will largely influence the real-time performences **/
+    if (pcd_save_en)
+    {
+        if (pcl_wait_save->size() == 0)
+        {
+            ROS_WARN("No point to save");
+        }
+        else
+        {
+            string file_name = string("scans.pcd");
+            string folder_name = string(ROOT_DIR) + "PCD/";
+            string all_points_dir(folder_name + file_name);
+            // create dir if not exist
+            if (access(folder_name.c_str(), 0) == -1)
+            {
+                mkdir(folder_name.c_str(), 0777);
+            }
+            pcl::PCDWriter pcd_writer;
+            cout << "current scan saved to /PCD/" << file_name<<endl;
+            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        }
     }
 
     return 0;
